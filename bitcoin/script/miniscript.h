@@ -20,6 +20,7 @@
 #include <util/spanparsing.h>
 #include <util/strencodings.h>
 #include <util/vector.h>
+#include <primitives/transaction.h>
 
 namespace miniscript {
 
@@ -92,21 +93,34 @@ namespace miniscript {
  *   - This generally requires 'm' for all subexpressions, and 'e' for all subexpressions
  *     which are dissatisfied when satisfying the parent.
  *
- * One final type property is an implementation detail:
+ * One type property is an implementation detail:
  * - "x" Expensive verify:
  *   - Expressions with this property have a script whose last opcode is not EQUAL, CHECKSIG, or CHECKMULTISIG.
  *   - Not having this property means that it can be converted to a V at no cost (by switching to the
  *     -VERIFY version of the last opcode).
  *
+ * Five more type properties for representing timelock information. Spend paths
+ * in miniscripts containing conflicting timelocks and heightlocks cannot be spent together.
+ * This helps users detect if miniscript does not match the semantic behaviour the
+ * user expects.
+ * - "g" Whether the branch contains a relative time timelock
+ * - "h" Whether the branch contains a relative height timelock
+ * - "i" Whether the branch contains a absolute time timelock
+ * - "j" Whether the branch contains a absolute time heightlock
+ * - "k"
+ *   - Whether all satisfactions of this expression don't contain a mix of heightlock and timelock
+ *     of the same type.
+ *   - If the miniscript does not have the "k" property, the miniscript template will not match
+ *     the user expectation of the corresponding spending policy.
  * For each of these properties the subset rule holds: an expression with properties X, Y, and Z, is also
  * valid in places where an X, a Y, a Z, an XY, ... is expected.
 */
 class Type {
     //! Internal bitmap of properties (see ""_mst operator for details).
-    uint16_t m_flags;
+    uint32_t m_flags;
 
     //! Internal constructed used by the ""_mst operator.
-    explicit constexpr Type(uint16_t flags) : m_flags(flags) {}
+    explicit constexpr Type(uint32_t flags) : m_flags(flags) {}
 
 public:
     //! The only way to publicly construct a Type is using this literal operator.
@@ -148,6 +162,11 @@ inline constexpr Type operator"" _mst(const char* c, size_t l) {
         *c == 's' ? 1 << 11 : // Safe property
         *c == 'm' ? 1 << 12 : // Nonmalleable property
         *c == 'x' ? 1 << 13 : // Expensive verify
+        *c == 'g' ? 1 << 14 : // older: contains relative time timelock   (csv_time)
+        *c == 'h' ? 1 << 15 : // older: contains relative height timelock (csv_height)
+        *c == 'i' ? 1 << 16 : // after: contains time timelock   (cltv_time)
+        *c == 'j' ? 1 << 17 : // after: contains height timelock   (cltv_height)
+        *c == 'k' ? 1 << 18 : // does not contain a combination of height and time locks
         (throw std::logic_error("Unknown character in _mst literal"), 0)
     );
 }
@@ -323,7 +342,7 @@ private:
     size_t CalcScriptLen() const {
         size_t subsize = 0;
         for (const auto& sub : subs) {
-            subsize += sub->ScriptSize();
+            subsize += sub->GetScriptSize();
         }
         Type sub0type = subs.size() > 0 ? subs[0]->GetType() : ""_mst;
         return internal::ComputeScriptLen(nodetype, sub0type, subsize, k, subs.size(), keys.size());
@@ -445,10 +464,10 @@ private:
             }
             case NodeType::AFTER: return std::move(ret) + "after(" + std::to_string(k) + ")";
             case NodeType::OLDER: return std::move(ret) + "older(" + std::to_string(k) + ")";
-            case NodeType::HASH256: return std::move(ret) + "hash256(" + HexStr(data.begin(), data.end()) + ")";
-            case NodeType::HASH160: return std::move(ret) + "hash160(" + HexStr(data.begin(), data.end()) + ")";
-            case NodeType::SHA256: return std::move(ret) + "sha256(" + HexStr(data.begin(), data.end()) + ")";
-            case NodeType::RIPEMD160: return std::move(ret) + "ripemd160(" + HexStr(data.begin(), data.end()) + ")";
+            case NodeType::HASH256: return std::move(ret) + "hash256(" + HexStr(data) + ")";
+            case NodeType::HASH160: return std::move(ret) + "hash160(" + HexStr(data) + ")";
+            case NodeType::SHA256: return std::move(ret) + "sha256(" + HexStr(data) + ")";
+            case NodeType::RIPEMD160: return std::move(ret) + "ripemd160(" + HexStr(data) + ")";
             case NodeType::JUST_1: return std::move(ret) + "1";
             case NodeType::JUST_0: return std::move(ret) + "0";
             case NodeType::AND_V: return std::move(ret) + "and_v(" + subs[0]->MakeString(ctx, success) + "," + subs[1]->MakeString(ctx, success) + ")";
@@ -735,7 +754,10 @@ private:
 
 public:
     //! Return the size of the script for this expression (faster than ToString().size()).
-    size_t ScriptSize() const { return scriptlen; }
+    size_t GetScriptSize() const { return scriptlen; }
+
+    //! Check the size of the script against policy limits
+    bool CheckScriptSize() const { return GetScriptSize() <= MAX_STANDARD_P2WSH_SCRIPT_SIZE; }
 
     //! Return the maximum number of ops needed to satisfy this script non-malleably.
     uint32_t GetOps() const { return ops.stat + ops.sat.value; }
@@ -748,6 +770,9 @@ public:
 
     //! Check the maximum stack size for this script against the policy limit.
     bool CheckStackSize() const { return GetStackSize() <= MAX_STANDARD_P2WSH_STACK_ITEMS; }
+
+    //! Check whether there is no satisfaction path that contains both timelocks and heightlocks
+    bool CheckTimeLocksMix() const { return GetType() << "k"_mst; }
 
     //! Return the expression type.
     Type GetType() const { return typ; }
@@ -765,7 +790,7 @@ public:
     bool NeedsSignature() const { return GetType() << "s"_mst; }
 
     //! Do all sanity checks.
-    bool IsSafeTopLevel() const { return GetType() << "Bms"_mst && CheckOpsLimit() && CheckStackSize(); }
+    bool IsSafeTopLevel() const { return GetType() << "Bms"_mst && CheckOpsLimit() && CheckStackSize() && CheckTimeLocksMix() && CheckScriptSize(); }
 
     //! Construct the script for this miniscript (including subexpressions).
     template<typename Ctx>
@@ -825,6 +850,7 @@ static constexpr int MAX_PARSE_RECURSION = 201;
 //! Parse a miniscript from its textual descriptor form.
 template<typename Key, typename Ctx>
 inline NodeRef<Key> Parse(Span<const char>& in, const Ctx& ctx, int recursion_depth, bool wrappers_parsed = false) {
+    using namespace spanparsing;
     if (recursion_depth >= MAX_PARSE_RECURSION) {
         return {};
     }
@@ -833,7 +859,7 @@ inline NodeRef<Key> Parse(Span<const char>& in, const Ctx& ctx, int recursion_de
     if (!wrappers_parsed) {
         // colon cannot be the first character
         //`:pk()` is invalid miniscript
-        for (int i = 1; i < expr.size(); ++i) {
+        for (unsigned int i = 1; i < expr.size(); ++i) {
             if (expr[i] == ':') {
                 auto in2 = expr.subspan(i + 1);
                 // pass wrappers_parsed = true to avoid multi-colons

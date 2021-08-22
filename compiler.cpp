@@ -92,6 +92,7 @@ Policy ParseProb(Span<const char>& in, uint32_t& prob) {
 }
 
 Policy Parse(Span<const char>& in) {
+    using namespace spanparsing;
     auto expr = Expr(in);
     if (Func("pk", expr)) {
         std::string key;
@@ -222,14 +223,14 @@ struct Strat {
 typedef std::vector<std::unique_ptr<Strat>> StratStore;
 
 template <typename... X>
-const Strat* MakeStrat(StratStore& store, X&&... args) { 
+const Strat* MakeStrat(StratStore& store, X&&... args) {
     Strat* ret = new Strat(std::forward<X>(args)...);
     store.emplace_back(ret);
     return ret;
 }
 
 template <typename... X>
-Strat* MakeMutStrat(StratStore& store, X&&... args) { 
+Strat* MakeMutStrat(StratStore& store, X&&... args) {
     Strat* ret = new Strat(std::forward<X>(args)...);
     store.emplace_back(ret);
     return ret;
@@ -367,8 +368,8 @@ struct Result {
     int Compare(double other_cost, const Node& other_node) const {
         if (cost < other_cost) return -1;
         if (cost > other_cost) return 1;
-        if (node->ScriptSize() > other_node->ScriptSize()) return -1;
-        if (node->ScriptSize() < other_node->ScriptSize()) return 1;
+        if (node->GetScriptSize() > other_node->GetScriptSize()) return -1;
+        if (node->GetScriptSize() < other_node->GetScriptSize()) return 1;
         return 0;
     }
 
@@ -402,14 +403,13 @@ struct Compilation {
     ~Compilation() = default;
 
     double Cost(const CostPair& pair, const Node& node) {
-        return node->ScriptSize() + Mul(p, pair.sat) + Mul(q, pair.nsat);
+        return node->GetScriptSize() + Mul(p, pair.sat) + Mul(q, pair.nsat);
     }
 
     void Add(const CostPair& pair, Node node) {
         auto new_typ = node->GetType();
         double cost = Cost(pair, node);
-        if (!node->CheckOpsLimit()) return;
-        if (node->GetStackSize() > MAX_STANDARD_P2WSH_STACK_ITEMS) return;
+        if (!node->IsSafeTopLevel()) return;
         if (!(new_typ << "m"_mst)) return;
         if (cost > 10000) return;
         for (const Result& x : results) {
